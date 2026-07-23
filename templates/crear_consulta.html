@@ -10,7 +10,8 @@
         <p>El sistema analizara el texto y buscara un abogado con la especialidad mas cercana.</p>
     </div>
 
-    <form class="card form-card wide" method="POST">
+    <form class="card form-card wide" method="POST" data-loading-title="Enviando tu consulta" data-loading-description="Estamos registrando el caso, buscando un especialista y preparando su respaldo.">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <h2>Informacion del caso</h2>
         <label>
             Titulo
