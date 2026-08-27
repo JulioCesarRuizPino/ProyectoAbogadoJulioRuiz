@@ -26,11 +26,10 @@
 
     <fieldset class="checkbox-grid">
         <legend>Especialidades</legend>
-        {% set seleccionadas = abogado['especialidades'].split(', ') if abogado['especialidades'] else [] %}
         {% for especialidad in especialidades_disponibles %}
             <label>
-                <input type="checkbox" name="especialidades" value="{{ especialidad }}" {% if especialidad in seleccionadas %}checked{% endif %}>
-                {{ especialidad|capitalize }}
+                <input type="checkbox" name="especialidades" value="{{ especialidad['nombre'] }}" {% if especialidad['nombre'] in abogado['especialidades_seleccionadas'] %}checked{% endif %}>
+                {{ especialidad['nombre']|capitalize }}
             </label>
         {% endfor %}
     </fieldset>

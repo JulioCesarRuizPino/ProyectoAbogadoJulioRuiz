@@ -30,8 +30,8 @@
             <legend>Especialidades</legend>
             {% for especialidad in especialidades_disponibles %}
                 <label>
-                    <input type="checkbox" name="especialidades" value="{{ especialidad }}">
-                    {{ especialidad|capitalize }}
+                    <input type="checkbox" name="especialidades" value="{{ especialidad['nombre'] }}">
+                    {{ especialidad['nombre']|capitalize }}
                 </label>
             {% endfor %}
         </fieldset>

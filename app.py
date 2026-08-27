@@ -51,36 +51,13 @@ app.config['SESSION_COOKIE_SECURE'] = os.getenv('SESSION_COOKIE_SECURE', 'false'
 
 mysql = MySQL(app)
 
-ESPECIALIDADES = {
-    'familia': [
-        'divorcio', 'alimentos', 'pension', 'custodia', 'visitas', 'tuicion',
-        'familia', 'conyuge', 'matrimonio', 'hijos'
-    ],
-    'laboral': [
-        'despido', 'finiquito', 'sueldo', 'remuneracion', 'laboral',
-        'trabajo', 'empleador', 'contrato', 'cotizaciones', 'acoso'
-    ],
-    'civil': [
-        'contrato', 'deuda', 'arrendamiento', 'arriendo', 'indemnizacion',
-        'civil', 'propiedad', 'incumplimiento', 'cobranza'
-    ],
-    'penal': [
-        'delito', 'denuncia', 'querella', 'robo', 'estafa', 'amenaza',
-        'lesiones', 'penal', 'detencion', 'violencia', "hurto"
-    ],
-    'comercial': [
-        'empresa', 'sociedad', 'factura', 'comercial', 'marca', 'proveedor',
-        'cliente', 'quiebra', 'startup', 'negocio'
-    ],
-    'inmobiliario': [
-        'inmueble', 'casa', 'departamento', 'compraventa', 'hipoteca',
-        'condominio', 'terreno', 'inmobiliario', 'escritura'
-    ],
-    'migratorio': [
-        'visa', 'residencia', 'extranjero', 'migracion', 'permiso',
-        'nacionalidad', 'expulsion'
-    ],
-}
+
+@app.after_request
+def ensure_utf8_html_response(response):
+    """Fija UTF-8 en las vistas HTML para que tildes y eñes se muestren correctamente."""
+    if response.mimetype == 'text/html':
+        response.headers['Content-Type'] = 'text/html; charset=utf-8'
+    return response
 
 
 # Indica si la sesion actual pertenece a un usuario autenticado.
@@ -92,6 +69,17 @@ def login_required():
 # Comprueba que el usuario conectado sea el dueno del bufete.
 def owner_required():
     return login_required() and session.get('tipo') == 'dueno'
+
+
+# Obtiene el identificador de un valor de catalogo; los roles se administran en la base de datos.
+def get_tipo_usuario_id(nombre):
+    tipo = fetchone_dict("SELECT id FROM tipos_usuario WHERE nombre = %s", (nombre,))
+    return tipo['id'] if tipo else None
+
+
+def get_estado_consulta_id(nombre):
+    estado = fetchone_dict("SELECT id FROM estados_consulta WHERE nombre = %s", (nombre,))
+    return estado['id'] if estado else None
 
 
 # Un token por sesion evita que otro sitio pueda enviar formularios en nombre del usuario.
@@ -212,22 +200,64 @@ def email_in_use(email, excluding_user_id=None):
     return existing_user is not None
 
 
+# Obtiene las areas legales desde su propia tabla, no desde texto separado por comas.
+def get_especialidades():
+    return fetchall_dict("SELECT id, nombre FROM especialidades ORDER BY nombre")
+
+
+# Devuelve las especialidades seleccionadas de un abogado para marcar el formulario de edicion.
+def get_especialidades_abogado(abogado_id):
+    rows = fetchall_dict(
+        """
+        SELECT e.nombre
+        FROM especialidades e
+        JOIN abogado_especialidad ae ON ae.especialidad_id = e.id
+        WHERE ae.abogado_id = %s
+        ORDER BY e.nombre
+        """,
+        (abogado_id,)
+    )
+    return [row['nombre'] for row in rows]
+
+
+# Guarda la relacion muchos-a-muchos entre un abogado y sus areas legales.
+def guardar_especialidades_abogado(abogado_id, nombres):
+    nombres_validos = {especialidad['nombre'] for especialidad in get_especialidades()}
+    nombres = sorted(set(nombres) & nombres_validos)
+    cur = mysql.connection.cursor()
+    cur.execute("DELETE FROM abogado_especialidad WHERE abogado_id = %s", (abogado_id,))
+    if nombres:
+        placeholders = ', '.join(['%s'] * len(nombres))
+        cur.execute(
+            f"SELECT id, nombre FROM especialidades WHERE nombre IN ({placeholders})",
+            tuple(nombres)
+        )
+        cur.executemany(
+            "INSERT INTO abogado_especialidad (abogado_id, especialidad_id) VALUES (%s, %s)",
+            [(abogado_id, especialidad_id) for especialidad_id, _ in cur.fetchall()]
+        )
+
+
 # Obtiene los perfiles de todos los usuarios registrados como abogados.
 def get_abogados():
     return fetchall_dict(
         """
         SELECT
-            id,
-            nombre,
-            email,
-            COALESCE(especialidades, '') AS especialidades,
-            COALESCE(foto_url, '') AS foto_url,
-            COALESCE(bio, '') AS bio,
-            COALESCE(universidad, '') AS universidad,
-            COALESCE(experiencia, '') AS experiencia
-        FROM usuarios
-        WHERE tipo = %s
-        ORDER BY nombre
+            u.id,
+            u.nombre,
+            u.email,
+            COALESCE(GROUP_CONCAT(e.nombre ORDER BY e.nombre SEPARATOR ', '), '') AS especialidades,
+            COALESCE(u.foto_url, '') AS foto_url,
+            COALESCE(u.bio, '') AS bio,
+            COALESCE(u.universidad, '') AS universidad,
+            COALESCE(u.experiencia, '') AS experiencia
+        FROM usuarios u
+        JOIN tipos_usuario tu ON tu.id = u.tipo_id
+        LEFT JOIN abogado_especialidad ae ON ae.abogado_id = u.id
+        LEFT JOIN especialidades e ON e.id = ae.especialidad_id
+        WHERE tu.nombre = %s
+        GROUP BY u.id, u.nombre, u.email, u.foto_url, u.bio, u.universidad, u.experiencia
+        ORDER BY u.nombre
         """,
         ('abogado',)
     )
@@ -243,7 +273,7 @@ def get_consulta_por_id(consulta_id):
             c.descripcion,
             c.usuario_id,
             c.abogado_id,
-            c.estado,
+            ec.nombre AS estado,
             COALESCE(c.especialidad_detectada, '') AS especialidad_detectada,
             COALESCE(c.pdf_respaldo, '') AS pdf_respaldo,
             cliente.nombre AS cliente_nombre,
@@ -251,6 +281,7 @@ def get_consulta_por_id(consulta_id):
             COALESCE(abogado.nombre, '') AS abogado_nombre,
             COALESCE(abogado.email, '') AS abogado_email
         FROM consultas c
+        JOIN estados_consulta ec ON ec.id = c.estado_id
         JOIN usuarios cliente ON cliente.id = c.usuario_id
         LEFT JOIN usuarios abogado ON abogado.id = c.abogado_id
         WHERE c.id = %s
@@ -274,16 +305,29 @@ def usuario_puede_ver_consulta(consulta):
 
 # Analiza el titulo y la descripcion para identificar el area legal mas probable.
 def detectar_especialidad(titulo, descripcion):
-    # Da mas peso al titulo porque normalmente resume mejor el problema legal.
+    # Las palabras y sus pesos se administran desde la tabla, sin listas escritas en el codigo.
     titulo_normalizado = normalizar_texto(titulo)
     descripcion_normalizada = normalizar_texto(descripcion)
     puntajes = {}
 
-    for especialidad, palabras in ESPECIALIDADES.items():
-        puntaje_titulo = sum(3 for palabra in palabras if palabra in titulo_normalizado)
-        puntaje_descripcion = sum(1 for palabra in palabras if palabra in descripcion_normalizada)
-        puntajes[especialidad] = puntaje_titulo + puntaje_descripcion
+    palabras_clave = fetchall_dict(
+        """
+        SELECT e.nombre AS especialidad, p.palabra, p.peso_titulo, p.peso_descripcion
+        FROM especialidad_palabra_clave p
+        JOIN especialidades e ON e.id = p.especialidad_id
+        """
+    )
+    for palabra_clave in palabras_clave:
+        especialidad = palabra_clave['especialidad']
+        palabra = normalizar_texto(palabra_clave['palabra'])
+        puntajes.setdefault(especialidad, 0)
+        if palabra in titulo_normalizado:
+            puntajes[especialidad] += palabra_clave['peso_titulo']
+        if palabra in descripcion_normalizada:
+            puntajes[especialidad] += palabra_clave['peso_descripcion']
 
+    if not puntajes:
+        return None
     especialidad, puntaje = max(puntajes.items(), key=lambda item: item[1])
     return especialidad if puntaje > 0 else None
 
@@ -293,30 +337,23 @@ def elegir_abogado_para_especialidad(especialidad):
     if not especialidad:
         return None
 
-    abogados = fetchall_dict(
+    abogado = fetchone_dict(
         """
-        SELECT id, COALESCE(especialidades, '') AS especialidades
-        FROM usuarios
-        WHERE tipo = %s
+        SELECT u.id, COUNT(ec.id) AS total
+        FROM usuarios u
+        JOIN abogado_especialidad ae ON ae.abogado_id = u.id
+        JOIN especialidades e ON e.id = ae.especialidad_id
+        JOIN tipos_usuario tu ON tu.id = u.tipo_id
+        LEFT JOIN consultas c ON c.abogado_id = u.id
+        LEFT JOIN estados_consulta ec ON ec.id = c.estado_id AND ec.nombre != 'cerrado'
+        WHERE tu.nombre = %s AND e.nombre = %s
+        GROUP BY u.id
+        ORDER BY total ASC, u.id ASC
+        LIMIT 1
         """,
-        ('abogado',)
+        ('abogado', especialidad)
     )
-
-    mejores_coincidencias = []
-    for abogado in abogados:
-        especialidades = normalizar_texto(abogado['especialidades'])
-        if especialidad in especialidades:
-            carga = fetchone_dict(
-                "SELECT COUNT(*) AS total FROM consultas WHERE abogado_id = %s",
-                (abogado['id'],)
-            )
-            mejores_coincidencias.append((carga['total'], abogado['id']))
-
-    if not mejores_coincidencias:
-        return None
-
-    mejores_coincidencias.sort()
-    return mejores_coincidencias[0][1]
+    return abogado['id'] if abogado else None
 
 
 # Escapa caracteres especiales para que se puedan escribir correctamente en el PDF.
@@ -617,7 +654,7 @@ def inject_globals():
         unread_count = row['total']
 
     return {
-        'especialidades_disponibles': ESPECIALIDADES.keys(),
+        'especialidades_disponibles': get_especialidades(),
         'unread_notifications': unread_count,
         'sound_notifications_available': login_required(),
         'csrf_token': get_csrf_token(),
@@ -643,7 +680,15 @@ def abogados_publicos():
 @app.route('/crear_dueno', methods=['GET', 'POST'])
 def crear_dueno():
     cur = mysql.connection.cursor()
-    cur.execute("SELECT COUNT(*) FROM usuarios WHERE tipo = %s", ('dueno',))
+    cur.execute(
+        """
+        SELECT COUNT(*)
+        FROM usuarios u
+        JOIN tipos_usuario tu ON tu.id = u.tipo_id
+        WHERE tu.nombre = %s
+        """,
+        ('dueno',)
+    )
     existe_dueno = cur.fetchone()[0] > 0
 
     if existe_dueno:
@@ -663,8 +708,8 @@ def crear_dueno():
         password = request.form['password']
 
         cur.execute(
-            "INSERT INTO usuarios (nombre, email, password, tipo) VALUES (%s, %s, %s, %s)",
-            (nombre, email, hash_password(password), 'dueno')
+            "INSERT INTO usuarios (nombre, email, password, tipo_id) VALUES (%s, %s, %s, %s)",
+            (nombre, email, hash_password(password), get_tipo_usuario_id('dueno'))
         )
         mysql.connection.commit()
         flash('Dueno creado correctamente. Ahora puedes iniciar sesion.')
@@ -694,10 +739,10 @@ def register():
         cur.execute(
             """
             INSERT INTO usuarios
-                (nombre, email, password, tipo, especialidades, foto_url, bio, universidad, experiencia)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (nombre, email, password, tipo_id, foto_url, bio, universidad, experiencia)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
-            (nombre, email, hash_password(password), tipo, '', '', '', '', '')
+            (nombre, email, hash_password(password), get_tipo_usuario_id(tipo), '', '', '', '')
         )
         mysql.connection.commit()
         flash('Usuario registrado correctamente')
@@ -714,7 +759,15 @@ def login():
         password = request.form.get('password', '')
 
         cur = mysql.connection.cursor()
-        cur.execute("SELECT * FROM usuarios WHERE email=%s", (email,))
+        cur.execute(
+            """
+            SELECT u.id, u.nombre, u.email, u.password, tu.nombre AS tipo
+            FROM usuarios u
+            JOIN tipos_usuario tu ON tu.id = u.tipo_id
+            WHERE u.email = %s
+            """,
+            (email,)
+        )
         user = cur.fetchone()
 
         password_is_hashed = bool(user) and verify_password(user[3], password)
@@ -775,7 +828,7 @@ def gestionar_abogados():
             flash('Ya existe una cuenta con ese correo electronico.')
             return redirect('/abogados')
         password = request.form['password']
-        especialidades = ', '.join(request.form.getlist('especialidades'))
+        especialidades = request.form.getlist('especialidades')
         foto_url = request.form.get('foto_url', '')
         bio = request.form.get('bio', '')
         universidad = request.form.get('universidad', '')
@@ -784,11 +837,12 @@ def gestionar_abogados():
         cur.execute(
             """
             INSERT INTO usuarios
-                (nombre, email, password, tipo, especialidades, foto_url, bio, universidad, experiencia)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (nombre, email, password, tipo_id, foto_url, bio, universidad, experiencia)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
-            (nombre, email, hash_password(password), 'abogado', especialidades, foto_url, bio, universidad, experiencia)
+            (nombre, email, hash_password(password), get_tipo_usuario_id('abogado'), foto_url, bio, universidad, experiencia)
         )
+        guardar_especialidades_abogado(cur.lastrowid, especialidades)
         mysql.connection.commit()
         flash('Abogado creado correctamente con su perfil profesional')
         return redirect('/abogados')
@@ -806,11 +860,11 @@ def editar_abogado(abogado_id):
     abogado = fetchone_dict(
         """
         SELECT
-            id, nombre, email, COALESCE(especialidades, '') AS especialidades,
-            COALESCE(foto_url, '') AS foto_url, COALESCE(bio, '') AS bio,
-            COALESCE(universidad, '') AS universidad, COALESCE(experiencia, '') AS experiencia
-        FROM usuarios
-        WHERE id = %s AND tipo = %s
+            u.id, u.nombre, u.email, COALESCE(u.foto_url, '') AS foto_url, COALESCE(u.bio, '') AS bio,
+            COALESCE(u.universidad, '') AS universidad, COALESCE(u.experiencia, '') AS experiencia
+        FROM usuarios u
+        JOIN tipos_usuario tu ON tu.id = u.tipo_id
+        WHERE u.id = %s AND tu.nombre = %s
         """,
         (abogado_id, 'abogado')
     )
@@ -818,6 +872,8 @@ def editar_abogado(abogado_id):
     if abogado is None:
         flash('Abogado no encontrado')
         return redirect('/abogados')
+
+    abogado['especialidades_seleccionadas'] = get_especialidades_abogado(abogado_id)
 
     if request.method == 'POST':
         nombre = request.form.get('nombre', '').strip()
@@ -832,7 +888,7 @@ def editar_abogado(abogado_id):
         if email_in_use(email, excluding_user_id=abogado_id):
             flash('Ya existe una cuenta con ese correo electronico.')
             return redirect(url_for('editar_abogado', abogado_id=abogado_id))
-        especialidades = ', '.join(request.form.getlist('especialidades'))
+        especialidades = request.form.getlist('especialidades')
         foto_url = request.form.get('foto_url', '')
         bio = request.form.get('bio', '')
         universidad = request.form.get('universidad', '')
@@ -843,22 +899,23 @@ def editar_abogado(abogado_id):
             cur.execute(
                 """
                 UPDATE usuarios
-                SET nombre = %s, email = %s, password = %s, especialidades = %s,
+                SET nombre = %s, email = %s, password = %s,
                     foto_url = %s, bio = %s, universidad = %s, experiencia = %s
                 WHERE id = %s
                 """,
-                (nombre, email, hash_password(password), especialidades, foto_url, bio, universidad, experiencia, abogado_id)
+                (nombre, email, hash_password(password), foto_url, bio, universidad, experiencia, abogado_id)
             )
         else:
             cur.execute(
                 """
                 UPDATE usuarios
-                SET nombre = %s, email = %s, especialidades = %s,
+                SET nombre = %s, email = %s,
                     foto_url = %s, bio = %s, universidad = %s, experiencia = %s
                 WHERE id = %s
                 """,
-                (nombre, email, especialidades, foto_url, bio, universidad, experiencia, abogado_id)
+                (nombre, email, foto_url, bio, universidad, experiencia, abogado_id)
             )
+        guardar_especialidades_abogado(abogado_id, especialidades)
         mysql.connection.commit()
         flash('Perfil del abogado actualizado correctamente')
         return redirect('/abogados')
@@ -889,10 +946,10 @@ def crear_consulta():
         cur.execute(
             """
             INSERT INTO consultas
-                (titulo, descripcion, usuario_id, abogado_id, especialidad_detectada, estado)
+                (titulo, descripcion, usuario_id, abogado_id, especialidad_detectada, estado_id)
             VALUES (%s, %s, %s, %s, %s, %s)
             """,
-            (titulo, descripcion, usuario_id, abogado_id, especialidad_detectada, 'pendiente')
+            (titulo, descripcion, usuario_id, abogado_id, especialidad_detectada, get_estado_consulta_id('pendiente'))
         )
         mysql.connection.commit()
         consulta_id = cur.lastrowid
@@ -934,11 +991,12 @@ def ver_consultas():
             c.descripcion,
             cliente.nombre AS cliente,
             COALESCE(abogado.nombre, '') AS abogado,
-            c.estado,
+            ec.nombre AS estado,
             c.abogado_id,
             COALESCE(c.especialidad_detectada, '') AS especialidad_detectada,
             COALESCE(c.pdf_respaldo, '') AS pdf_respaldo
         FROM consultas c
+        JOIN estados_consulta ec ON ec.id = c.estado_id
         JOIN usuarios cliente ON cliente.id = c.usuario_id
         LEFT JOIN usuarios abogado ON abogado.id = c.abogado_id
     """
@@ -992,7 +1050,15 @@ def asignar_consulta(consulta_id):
 
     abogado_id = request.form.get('abogado_id') or None
     if abogado_id:
-        abogado = fetchone_dict("SELECT id FROM usuarios WHERE id = %s AND tipo = %s", (abogado_id, 'abogado'))
+        abogado = fetchone_dict(
+            """
+            SELECT u.id
+            FROM usuarios u
+            JOIN tipos_usuario tu ON tu.id = u.tipo_id
+            WHERE u.id = %s AND tu.nombre = %s
+            """,
+            (abogado_id, 'abogado')
+        )
         if not abogado:
             abort(400, description='El profesional seleccionado no es valido.')
     cur = mysql.connection.cursor()
@@ -1024,7 +1090,10 @@ def cerrar_consulta(consulta_id):
         return redirect('/consultas')
 
     cur = mysql.connection.cursor()
-    cur.execute("UPDATE consultas SET estado = %s WHERE id = %s", ('cerrado', consulta_id))
+    cur.execute(
+        "UPDATE consultas SET estado_id = %s WHERE id = %s",
+        (get_estado_consulta_id('cerrado'), consulta_id)
+    )
     mysql.connection.commit()
 
     notify_case_closed(get_consulta_por_id(consulta_id))
@@ -1099,9 +1168,10 @@ def chat_consulta(consulta_id):
             m.creado_en,
             u.id AS remitente_id,
             u.nombre AS remitente_nombre,
-            u.tipo AS remitente_tipo
+            tu.nombre AS remitente_tipo
         FROM mensajes_chat m
         JOIN usuarios u ON u.id = m.remitente_id
+        JOIN tipos_usuario tu ON tu.id = u.tipo_id
         WHERE m.consulta_id = %s
         ORDER BY m.id ASC
         """,
